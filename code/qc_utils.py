@@ -94,10 +94,55 @@ def load_preprocessed_recording(preprocessed_json_file, session_name, ecephys_fo
                     json_str_remapped = json_str.replace("ecephys_session", ecephys_folder.name)
                 elif ecephys_folder.name != session_name and session_name in json_str:
                     json_str_remapped = json_str.replace(session_name, ecephys_folder.name)
+                else:
+                    json_str_remapped = json_str
                 recording_dict = json.loads(json_str_remapped)
                 recording_preprocessed = si.load(recording_dict, base_folder=data_folder)
             except:
                 pass
+        if recording_preprocessed is None:
+            # UCL patch (why we're here): the saved recording's folder_path is
+            # a relative path like "../../../../data/spikeglx/concat_session".
+            # It was correct at save time, but Nextflow tasks don't all sit at
+            # the same folder depth, so the "../" count is now wrong and the
+            # path resolves to nowhere.
+            #
+            # Fix: search data_folder for a folder/file with the same NAME
+            # (e.g. "concat_session") and use that instead.
+            try:
+                recording_dict = json.load(open(preprocessed_json_file))
+
+                def _fix_paths(obj):
+                    if isinstance(obj, dict):
+                        for key in ("folder_path", "file_path"):
+                            if key in obj and isinstance(obj[key], str):
+                                candidate = (data_folder / obj[key]).resolve()
+                                if not candidate.exists():
+                                    basename = Path(obj[key]).name
+                                    matches = list(data_folder.rglob(basename))
+                                    matches = [m for m in matches if m.is_dir() or m.is_file()]
+                                    if len(matches) == 1:
+                                        logging.info(
+                                            f"UCL patch: remapped broken path '{obj[key]}' "
+                                            f"-> '{matches[0]}'"
+                                        )
+                                        obj[key] = str(matches[0])
+                                    else:
+                                        logging.warning(
+                                            f"UCL patch: could not remap broken path '{obj[key]}' "
+                                            f"(basename '{basename}'): found {len(matches)} candidate(s) "
+                                            f"under {data_folder}: {matches}"
+                                        )
+                        for v in obj.values():
+                            _fix_paths(v)
+                    elif isinstance(obj, list):
+                        for v in obj:
+                            _fix_paths(v)
+
+                _fix_paths(recording_dict)
+                recording_preprocessed = si.load(recording_dict, base_folder=data_folder)
+            except Exception as e:
+                logging.info(f"UCL patch: path-remap fallback also failed: {e}")
         if recording_preprocessed is None:
             logging.info("Error loading preprocessed data...")
     else:
@@ -772,11 +817,30 @@ def generate_event_qc(
         ax_sat_time.set_title(
             f"Saturation events:\nPositive: {len(pos_evts)} -- Negative: {len(neg_evts)}"
         )
+        def _get_event_times(recording, evts):
+            """
+            UCL patch (why we're here): recording.get_times() errors out on
+            multi-segment recordings (e.g. multi-day sessions built with
+            si.append_recordings) unless you tell it which segment.
+
+            Fix: each event already knows which segment it's from
+            (evts["segment_index"]), so look up times per-segment instead
+            of calling get_times() on the whole recording at once.
+            """
+            if recording.get_num_segments() == 1:
+                return recording.get_times()[evts["sample_index"]]
+            evt_times = np.empty(len(evts), dtype=float)
+            for seg_index in np.unique(evts["segment_index"]):
+                seg_mask = evts["segment_index"] == seg_index
+                seg_times = recording.get_times(segment_index=int(seg_index))
+                evt_times[seg_mask] = seg_times[evts["sample_index"][seg_mask]]
+            return evt_times
+
         if len(pos_evts) > 0:
-            pos_evt_times = recording.get_times()[pos_evts["sample_index"]]
+            pos_evt_times = _get_event_times(recording, pos_evts)
             ax_sat_time.plot(pos_evt_times, np.ones_like(pos_evt_times), ls="", marker="|", markersize=20, color="r", label="positive")
         if len(neg_evts) > 0:
-            neg_evt_times = recording.get_times()[neg_evts["sample_index"]]
+            neg_evt_times = _get_event_times(recording, neg_evts)
             ax_sat_time.plot(neg_evt_times, -np.ones_like(neg_evt_times), ls="", marker="|", markersize=20, color="b", label="negative")
         ax_sat_time.legend()
         ax_sat_time.set_xlabel("Time (s)")
