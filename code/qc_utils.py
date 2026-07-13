@@ -107,13 +107,41 @@ def load_preprocessed_recording(preprocessed_json_file, session_name, ecephys_fo
             # the same folder depth, so the "../" count is now wrong and the
             # path resolves to nowhere.
             #
-            # Fix: search data_folder for a folder/file with the same NAME
-            # (e.g. "concat_session") and use that instead.
+            # Primary fix: search data_folder for a folder/file with the same
+            # NAME (e.g. "concat_session") and use that instead.
+            #
+            # UCL patch (2nd tier): the primary basename search fails whenever
+            # the raw data folder was staged under a different name than its
+            # original basename -- e.g. Nextflow stages the raw session as
+            # "ecephys_session" regardless of what it was called on disk when
+            # preprocessing ran (e.g. "concat_session"), so no folder named
+            # "concat_session" exists anywhere under data_folder to find.
+            # When basename search fails, check whether this specific broken
+            # path belongs to a raw recording *reader* node (identified via
+            # the SpikeInterface JSON's "class" field, e.g.
+            # "...SpikeGLXRecordingExtractor" / "...OpenEphysBinaryRecordingExtractor")
+            # rather than some other unrelated folder_path (e.g. a whitening
+            # matrix or motion folder). If so, and the caller has told us
+            # where the raw session actually lives (ecephys_folder), use that
+            # directly -- we already know precisely where it is, so there's
+            # no need to guess by name.
+            raw_reader_class_markers = ("SpikeGLX", "OpenEphys", "NeuroScope", "Neuralynx", "Intan")
+
+            def _is_raw_reader_class(class_name):
+                return isinstance(class_name, str) and any(
+                    marker in class_name for marker in raw_reader_class_markers
+                )
+
             try:
                 recording_dict = json.load(open(preprocessed_json_file))
 
-                def _fix_paths(obj):
+                def _fix_paths(obj, class_name=None):
                     if isinstance(obj, dict):
+                        # this dict is itself a SpikeInterface extractor node
+                        # (has "class"/"kwargs"): remember its class name so
+                        # that when we recurse into its "kwargs" dict, we know
+                        # what kind of reader we're looking at.
+                        node_class_name = obj.get("class", class_name)
                         for key in ("folder_path", "file_path"):
                             if key in obj and isinstance(obj[key], str):
                                 candidate = (data_folder / obj[key]).resolve()
@@ -124,9 +152,22 @@ def load_preprocessed_recording(preprocessed_json_file, session_name, ecephys_fo
                                     if len(matches) == 1:
                                         logging.info(
                                             f"UCL patch: remapped broken path '{obj[key]}' "
-                                            f"-> '{matches[0]}'"
+                                            f"-> '{matches[0]}' (basename match)"
                                         )
                                         obj[key] = str(matches[0])
+                                    elif (
+                                        _is_raw_reader_class(class_name)
+                                        and ecephys_folder is not None
+                                        and Path(ecephys_folder).exists()
+                                    ):
+                                        logging.warning(
+                                            f"UCL patch: could not remap broken path '{obj[key]}' "
+                                            f"by basename (found {len(matches)} candidate(s)); node "
+                                            f"class '{class_name}' looks like a raw recording reader, "
+                                            f"so falling back to the known raw session mount "
+                                            f"'{ecephys_folder}' instead."
+                                        )
+                                        obj[key] = str(ecephys_folder)
                                     else:
                                         logging.warning(
                                             f"UCL patch: could not remap broken path '{obj[key]}' "
@@ -134,10 +175,10 @@ def load_preprocessed_recording(preprocessed_json_file, session_name, ecephys_fo
                                             f"under {data_folder}: {matches}"
                                         )
                         for v in obj.values():
-                            _fix_paths(v)
+                            _fix_paths(v, class_name=node_class_name)
                     elif isinstance(obj, list):
                         for v in obj:
-                            _fix_paths(v)
+                            _fix_paths(v, class_name=class_name)
 
                 _fix_paths(recording_dict)
                 recording_preprocessed = si.load(recording_dict, base_folder=data_folder)
