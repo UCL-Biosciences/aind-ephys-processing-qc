@@ -666,20 +666,97 @@ def generate_drift_qc(
     all_peak_locations = motion_info["peak_locations"]
     motion = motion_info["motion"]
 
-    fig_drift, axs_drift = plt.subplots(ncols=recording.get_num_segments(), figsize=(10, 10))
+    # UCL patch: for multi-segment recordings, the AIND preprocessing capsule
+    # concatenates all segments into one block before calling compute_motion(),
+    # because SpikeInterface's estimate_motion() does not yet support multi-segment
+    # recordings natively (see AllenNeuralDynamics/spikeinterface#2626). As a result
+    # `motion.displacement` (and `all_peaks["segment_index"]`) may only contain a
+    # single segment (index 0) even when `recording` genuinely has multiple segments
+    # (e.g. several days of SpikeGLX concatenated via si.append_recordings()).
+    #
+    # Looping per-segment against `recording.get_num_segments()` in that case finds
+    # no peaks for segment_index >= 1 and crashes. Instead, when motion was computed
+    # on a concatenated view, we plot one continuous raster across the full
+    # concatenated timeline (which is what was actually estimated) and mark the real
+    # segment boundaries so inter-segment drift jumps -- the thing this plot exists to
+    # catch -- stay visible, rather than splitting into segment panels that don't
+    # correspond to what was computed.
+    motion_is_concatenated = (
+        motion is not None
+        and len(motion.displacement) == 1
+        and recording.get_num_segments() > 1
+    )
+
+    if motion_is_concatenated:
+        num_plot_segments = 1
+        # cumulative sample-boundary offsets (in seconds) between real segments,
+        # for marking day/session boundaries on the concatenated raster
+        segment_boundaries_s = []
+        cumulative_samples = 0
+        for s in range(recording.get_num_segments() - 1):
+            cumulative_samples += recording.get_num_samples(s)
+            segment_boundaries_s.append(cumulative_samples / recording.sampling_frequency)
+
+        # UCL patch: the boundary markers above assume the raw `recording`'s
+        # per-segment sample counts and order are the same ones that were
+        # concatenated to produce `motion`. That should hold as long as
+        # preprocessing doesn't drop/reorder samples, but if it ever doesn't
+        # (e.g. a future change to how segments are concatenated upstream),
+        # the markers would be silently wrong rather than absent. Check the
+        # raw recording's total duration against the actual duration covered
+        # by the concatenated motion estimate and warn loudly if they disagree.
+        total_duration_from_recording_s = (
+            sum(recording.get_num_samples(s) for s in range(recording.get_num_segments()))
+            / recording.sampling_frequency
+        )
+        total_duration_from_motion_s = motion.temporal_bins_s[0][-1]
+        duration_mismatch_s = abs(total_duration_from_recording_s - total_duration_from_motion_s)
+        # allow slack for motion's temporal binning (bins are centered, not
+        # edge-aligned, so the last bin center is expected to fall short of
+        # the true end by roughly half a bin width -- a few seconds is a
+        # generous margin for the bin widths typically used here)
+        duration_tolerance_s = 5.0
+        if duration_mismatch_s > duration_tolerance_s:
+            logging.warning(
+                f"UCL patch: segment-boundary markers may be WRONG for {recording_name}. "
+                f"Raw recording total duration ({total_duration_from_recording_s:.1f}s) does not "
+                f"match the duration covered by the concatenated motion estimate "
+                f"({total_duration_from_motion_s:.1f}s), difference={duration_mismatch_s:.1f}s. "
+                f"This likely means `recording`'s segments are not the same segments that were "
+                f"concatenated in preprocessing (different sample counts, order, or a segment was "
+                f"dropped/added) -- do not trust the blue boundary lines on this drift plot."
+            )
+    else:
+        num_plot_segments = recording.get_num_segments()
+        segment_boundaries_s = []
+
+    fig_drift, axs_drift = plt.subplots(ncols=num_plot_segments, figsize=(10, 10))
     y_locs = recording.get_channel_locations()[:, 1]
     sampling_frequency = recording.sampling_frequency
     depth_lim = [np.min(y_locs), np.max(y_locs)]
 
-    for segment_index in range(recording.get_num_segments()):
-        if recording.get_num_segments() == 1:
+    max_displacement = None
+    depth_at_max_displacement = None
+    max_cumulative_drift = None
+    depth_at_max_cumulative_drift = None
+
+    for plot_index in range(num_plot_segments):
+        if num_plot_segments == 1:
             ax_drift = axs_drift
         else:
-            ax_drift = axs_drift[segment_index]
+            ax_drift = axs_drift[plot_index]
 
-        segment_mask = all_peaks["segment_index"] == segment_index
-        peaks_to_plot = all_peaks[segment_mask]
-        peak_locations_to_plot = all_peak_locations[segment_mask]
+        if motion_is_concatenated:
+            # motion/peaks are already expressed in concatenated-timeline terms:
+            # plot everything against the single (index 0) motion segment.
+            peaks_to_plot = all_peaks
+            peak_locations_to_plot = all_peak_locations
+            motion_segment_index = 0
+        else:
+            segment_mask = all_peaks["segment_index"] == plot_index
+            peaks_to_plot = all_peaks[segment_mask]
+            peak_locations_to_plot = all_peak_locations[segment_mask]
+            motion_segment_index = plot_index
 
         _ = sw.plot_drift_raster_map(
             sorting_analyzer=None,
@@ -687,7 +764,7 @@ def generate_drift_qc(
             peak_locations=peak_locations_to_plot,
             recording=recording,
             sampling_frequency=sampling_frequency,
-            segment_index=segment_index,
+            segment_index=motion_segment_index,
             depth_lim=depth_lim,
             clim=(-200, 0),
             cmap="Greys_r",
@@ -698,9 +775,13 @@ def generate_drift_qc(
         ax_drift.spines["top"].set_visible(False)
         ax_drift.spines["right"].set_visible(False)
 
+        if motion_is_concatenated:
+            for boundary_s in segment_boundaries_s:
+                ax_drift.axvline(boundary_s, color="blue", linestyle="--", linewidth=1, alpha=0.7)
+
         if motion is not None:
-            displacement_arr = motion.displacement[segment_index]
-            temporal_bins = motion.temporal_bins_s[segment_index]
+            displacement_arr = motion.displacement[motion_segment_index]
+            temporal_bins = motion.temporal_bins_s[motion_segment_index]
             spatial_bins = motion.spatial_bins_um
 
             # calculate cumulative_drift and max displacement
@@ -718,10 +799,16 @@ def generate_drift_qc(
             ax_drift.plot(temporal_bins, displacement_arr + spatial_bins, color="red", alpha=0.5)
 
     if motion is not None:
-        ax_drift.set_title(
+        title = (
             f"Max displacement: {max_displacement} $\mu m$ (depth: {depth_at_max_displacement} ) $\\mu m$\n"
             f"Max cumulative drift: {max_cumulative_drift} $\mu m$ (depth: {depth_at_max_cumulative_drift} ) $\\mu m$\n"
         )
+        if motion_is_concatenated:
+            title += (
+                f"UCL note: motion estimated on {recording.get_num_segments()} concatenated segments; "
+                f"blue dashed lines mark segment boundaries at {[round(b, 1) for b in segment_boundaries_s]}s\n"
+            )
+        ax_drift.set_title(title)
 
     drift_map_path = recording_fig_folder / "drift_map.png"
     fig_drift.savefig(drift_map_path, dpi=300)
