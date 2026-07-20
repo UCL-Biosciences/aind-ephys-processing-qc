@@ -125,7 +125,28 @@ def load_preprocessed_recording(preprocessed_json_file, session_name, ecephys_fo
             # where the raw session actually lives (ecephys_folder), use that
             # directly -- we already know precisely where it is, so there's
             # no need to guess by name.
-            raw_reader_class_markers = ("SpikeGLX", "OpenEphys", "NeuroScope", "Neuralynx", "Intan")
+            # UCL patch (round 3): concatenated/append_recordings sessions are
+            # saved out as a plain binary-folder recording rather than read
+            # back in via one of the format-specific readers above, so their
+            # class name is "BinaryFolderRecording" / "BinaryRecordingExtractor"
+            # instead of e.g. "SpikeGLXRecordingExtractor". Add those classes
+            # by exact name (not a loose "Binary" substring match) since
+            # intermediate binary-saved caches elsewhere in the preprocessing
+            # chain can share the same class name -- a substring match would
+            # risk mis-identifying one of those as the raw session again, the
+            # same failure mode round 1 of this patch had to fix (see
+            # UCL_README, saturation-count regression). [UNCONFIRMED]: verify
+            # this doesn't regress on the non-concatenated SpikeGLX sessions
+            # before promoting out of UNCONFIRMED.
+            raw_reader_class_markers = (
+                "SpikeGLX",
+                "OpenEphys",
+                "NeuroScope",
+                "Neuralynx",
+                "Intan",
+                "BinaryFolderRecording",
+                "BinaryRecordingExtractor",
+            )
 
             def _is_raw_reader_class(class_name):
                 return isinstance(class_name, str) and any(
